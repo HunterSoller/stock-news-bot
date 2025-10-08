@@ -28,7 +28,7 @@ retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503,
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # ----------------------------
-# Time Window Configuration
+# Time / Window Configuration
 # ----------------------------
 ET = gettz("America/New_York")
 WINDOW_START = dtime(7, 0)
@@ -83,7 +83,7 @@ def extract_ticker(title: str) -> str | None:
         tick = (m.group(1) or m.group(2)).upper()
         if 2 <= len(tick) <= 5 and tick not in BLACKLIST:
             return tick
-    # fallback: uppercase 2–5 letters
+    # fallback: uppercase words 2–5 letters
     for w in re.findall(r"\b[A-Z]{2,5}\b", title):
         if w not in BLACKLIST:
             return w
@@ -109,11 +109,11 @@ def importance_score(title: str) -> int:
 # ----------------------------
 # Caching & Control Variables
 # ----------------------------
-sent_global = set()  # store (title, link)
+sent_global = set()
 last_batch_time = None
 
 def send_telegram(msg: str, chat_id: str):
-    payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": False}
     try:
         r = session.post(TG_API, json=payload, timeout=10)
         print("Telegram:", r.status_code, r.text[:200])
@@ -147,6 +147,7 @@ def scan_and_collect(feeds, is_bio: bool):
 def send_batch_alerts(collected):
     global last_batch_time
     if not collected:
+        print("No high‑importance items to send.")
         return
     now = dt.now(ET)
     if last_batch_time and (now - last_batch_time) < BATCH_DELAY:
@@ -165,48 +166,40 @@ def send_batch_alerts(collected):
 def in_window(now_dt):
     return WINDOW_START <= now_dt.time() <= WINDOW_END
 
+def manual_trigger():
+    """Force one test alert immediately."""
+    # Pick a realistic test that would pass the filters
+    title = "ACME surges 120% as revenue tops guidance"
+    link = "https://example.com/acme-surges"
+    ticker = "ACME"
+    sentiment = "BULLISH"
+    msg = f"*{sentiment}* ${ticker}\n{title}\n{link}"
+    send_telegram(msg, TG_MARKET)
+    send_telegram(msg, TG_BIOTECH)
+
 def main_loop():
     global BRIEF_SENT_DATE
     BRIEF_SENT_DATE = None
-    print("Bot starting with tightened rules.")
+    print("Bot running tightened filter mode.")
     while True:
         now = dt.now(ET)
         if now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
-            market_items = scan_and_collect(FEEDS_MARKET, False)
-            bio_items = scan_and_collect(FEEDS_BIOTECH, True)
-            send_batch_alerts(market_items + bio_items)
+            m = scan_and_collect(FEEDS_MARKET, False)
+            b = scan_and_collect(FEEDS_BIOTECH, True)
+            send_batch_alerts(m + b)
             BRIEF_SENT_DATE = now.date()
         elif in_window(now):
-            market_items = scan_and_collect(FEEDS_MARKET, False)
-            bio_items = scan_and_collect(FEEDS_BIOTECH, True)
-            send_batch_alerts(market_items + bio_items)
+            m = scan_and_collect(FEEDS_MARKET, False)
+            b = scan_and_collect(FEEDS_BIOTECH, True)
+            send_batch_alerts(m + b)
         else:
             time.sleep(600)
         time.sleep(120)
 
 if __name__ == "__main__":
     import sys
-    if "--test" in sys.argv:
-        print("Running test mode...")
-        msg = "*BULLISH* $TEST\nThis is a test alert.\nhttps://example.com"
-        send_telegram(msg, TG_MARKET)
-        send_telegram(msg, TG_BIOTECH)
-    else:
-        main_loop()
-def manual_trigger():
-    # Example custom test that meets your filters
-    title = "Company X surges 50% after record earnings"
-    link = "https://example.com/record-earnings"
-    ticker = "COMPX"
-    sentiment = "BULLISH"
-    msg = f"*{sentiment}* ${ticker}\n{title}\n{link}"
-    send_telegram(msg, TG_MARKET)
-    # And also for biotech if you want:
-    send_telegram(msg, TG_BIOTECH)
-
-if __name__ == "__main__":
-    import sys
     if "--manual" in sys.argv:
+        print("Manual trigger mode")
         manual_trigger()
     else:
         main_loop()
