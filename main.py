@@ -11,7 +11,7 @@ from dateutil.tz import gettz
 from requests.adapters import HTTPAdapter, Retry
 
 # ================================
-# Telegram & Environment
+# Environment / Telegram Setup
 # ================================
 TG_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_MARKET  = os.getenv("TG_CHAT_ID", "").strip()
@@ -21,12 +21,13 @@ if not TG_TOKEN or not TG_MARKET:
     raise SystemExit("Missing TG_BOT_TOKEN or TG_CHAT_ID env var.")
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 # ================================
-# Time window (Eastern Time)
+# Time Window (ET)
 # ================================
 ET = gettz("America/New_York")
 WINDOW_START = dtime(7, 0)
@@ -48,24 +49,23 @@ FEEDS_BIOTECH = [
 ]
 
 # ================================
-# Keywords for filtering and sentiment
+# Keywords & Sentiment Logic
 # ================================
-BULLISH_KEYWORDS = [
-    "beats", "surge", "record", "growth", "strong", "rises",
-    "profit", "upgraded", "soars", "jumps", "tops", "rallies", "outperforms"
+bullish_keywords = [
+    "beats", "surge", "record", "growth", "strong", "rises", "profit",
+    "upgraded", "outperforms", "soars", "jumps", "tops", "rallies"
 ]
-BEARISH_KEYWORDS = [
+bearish_keywords = [
     "misses", "drops", "falls", "decline", "loss", "downgraded",
-    "weak", "plunge", "disappoints", "warns", "cut", "reduces", "sinks"
+    "weak", "plunge", "disappoints", "warns", "cut", "reduces"
 ]
-ALL_KEYWORDS = BULLISH_KEYWORDS + BEARISH_KEYWORDS
 
 BLACKLIST = {"USD", "FOMC", "AI", "CEO", "ETF", "IPO", "EV", "FDA", "EPS", "GDP", "SEC"}
 
 def classify_sentiment(title: str) -> str:
     tl = title.lower()
-    b_score = sum(1 for kw in BULLISH_KEYWORDS if kw in tl)
-    s_score = sum(1 for kw in BEARISH_KEYWORDS if kw in tl)
+    b_score = sum(1 for kw in bullish_keywords if kw in tl)
+    s_score = sum(1 for kw in bearish_keywords if kw in tl)
     if b_score > s_score:
         return "BULLISH"
     elif s_score > b_score:
@@ -73,57 +73,48 @@ def classify_sentiment(title: str) -> str:
     else:
         return "NEUTRAL"
 
-def extract_ticker(title: str) -> str:
-    # Improved heuristic: look for $TICKER or uppercase words
-    parts = title.split()
-    for part in parts:
-        # if starts with $ and valid length
-        if part.startswith("$") and len(part) <= 6:
-            t = part[1:].upper()
-            if t.isalpha() and 1 < len(t) <= 5 and t not in BLACKLIST:
-                return t
-        # fallback: if it's uppercase and 2-5 letters
-        p = part.upper().strip(",.;:")
-        if p.isalpha() and 1 < len(p) <= 5 and p not in BLACKLIST:
-            return p
-    return None
-
 def clean(text: str) -> str:
     return text.strip()
 
+def extract_ticker(title: str) -> str:
+    # Simple heuristic: uppercase words 2–5 letters not blacklisted
+    for part in title.split():
+        p = part.strip().upper()
+        if p.isalpha() and 2 <= len(p) <= 5 and p not in BLACKLIST:
+            return p
+    return None
+
 # ================================
-# Scanning, Filtering, Sending
+# Scanning & Messaging
 # ================================
 def scan_and_send(feeds, force_bio=False):
     seen = set()
-    results = []
-    for feed_url in feeds:
-        feed = feedparser.parse(feed_url)
-        for entry in feed.entries:
-            title = clean(entry.get("title", ""))
+    items = []
+    for url in feeds:
+        feed = feedparser.parse(url)
+        for e in feed.entries:
+            title = clean(e.get("title", ""))
             if not title or title in seen:
                 continue
             seen.add(title)
 
-            tl = title.lower()
-            # require at least one keyword AND a ticker
-            if not any(kw in tl for kw in ALL_KEYWORDS):
+            # Only consider if keyword present
+            if not any(kw in title.lower() for kw in bullish_keywords + bearish_keywords):
                 continue
 
+            link = e.get("link", "").strip()
             ticker = extract_ticker(title)
-            if not ticker:
-                continue  # skip if no ticker
 
-            link = entry.get("link", "").strip()
+            items.append((title, link, ticker))
+            # Send immediately
             label = classify_sentiment(title)
-            msg = f"*{label}* ${ticker}\n{title}\n{link}"
-
+            msg_text = f"*{label}* {'$'+ticker if ticker else ''}\n{title}\n{link}"
+            # Decide which chat
             chat_id = TG_BIOTECH if force_bio and TG_BIOTECH else TG_MARKET
-            resp = session.post(TG_API, json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+            resp = session.post(TG_API, json={"chat_id": chat_id, "text": msg_text, "parse_mode": "Markdown"}, timeout=10)
             print("Telegram send response:", resp.status_code, resp.text)
 
-            results.append((title, link, ticker))
-    return results
+    return items
 
 def in_window(now_dt):
     return WINDOW_START <= now_dt.time() <= WINDOW_END
@@ -133,25 +124,33 @@ def main_loop():
     BRIEF_SENT_DATE = None
     while True:
         now = dt.now(ET)
+        # Send morning brief once per day
         if now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
-            scan_and_send(FEEDS_MARKET)
-            scan_and_send(FEEDS_BIOTECH, force_bio=True)
+            m_items = scan_and_send(FEEDS_MARKET)
+            b_items = scan_and_send(FEEDS_BIOTECH, force_bio=True)
             BRIEF_SENT_DATE = now.date()
+
+        # During window, continuously scan
         elif in_window(now):
             scan_and_send(FEEDS_MARKET)
             scan_and_send(FEEDS_BIOTECH, force_bio=True)
+
         time.sleep(60)
 
 if __name__ == "__main__":
     import sys
     if "--test" in sys.argv:
-        print("\n✅ Running in TEST mode")
-        test_items = [("Test Headline $TEST", "https://example.com", "TEST")]
-        for (t, link, ticker) in test_items:
-            label = classify_sentiment(t)
-            msg = f"*{label}* ${ticker}\n{t}\n{link}"
+        print("\n✅ Running in TEST mode: Sending one-time test messages")
+        test_m = [("Test Market Headline", "https://example.com", "TST")]
+        test_b = [("Test Bio Headline", "https://example.com", "BIO")]
+        for t, link, ticker in test_m:
+            msg = f"*{classify_sentiment(t)}* ${ticker}\n{t}\n{link}"
             resp = session.post(TG_API, json={"chat_id": TG_MARKET, "text": msg, "parse_mode": "Markdown"}, timeout=10)
             print("Telegram send response:", resp.status_code, resp.text)
-        print("✅ Test done")
+        for t, link, ticker in test_b:
+            msg = f"*{classify_sentiment(t)}* ${ticker}\n{t}\n{link}"
+            resp = session.post(TG_API, json={"chat_id": TG_BIOTECH, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+            print("Telegram send response:", resp.status_code, resp.text)
+        print("\n✅ Test messages sent")
     else:
         main_loop()
