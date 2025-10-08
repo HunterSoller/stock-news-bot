@@ -1,4 +1,7 @@
 # main.py
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import re
 import time
@@ -24,7 +27,6 @@ if not TG_TOKEN or not TG_MARKET:
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-# HTTP session with retry
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
@@ -35,7 +37,6 @@ session.mount('https://', HTTPAdapter(max_retries=retries))
 ET = gettz("America/New_York")
 WINDOW_START = dtime(7, 0)
 WINDOW_END   = dtime(20, 0)
-
 BRIEF_HOUR = 9
 BRIEF_SENT_DATE = None
 
@@ -54,18 +55,15 @@ BLACKLIST = {"USD", "FOMC", "AI", "CEO", "ETF", "IPO", "EV", "FDA", "EPS", "GDP"
 #  Feeds
 # =========================
 FEEDS_MARKET = [
-    "https://www.businesswire.com/portal/site/home/news/industry/?vnsId=31372&service=Rss",
-    "https://www.globenewswire.com/RssFeed/org/All",
-    "https://www.prnewswire.com/rss/all-news-releases-list.rss",
-    "https://seekingalpha.com/market_currents.xml",
-    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL,MSFT,TSLA,AMZN,GOOGL,NVDA,SPY,QQQ&region=US&lang=en-US",
     "https://www.cnbc.com/id/15839135/device/rss/rss.html",
+    "https://www.businesswire.com/portal/site/home/news/industry/?vnsId=31372&service=Rss",
+    "https://www.marketwatch.com/rss/topstories",
 ]
 
 FEEDS_BIOTECH = [
     "https://www.fiercebiotech.com/rss.xml",
     "https://www.biopharmadive.com/feeds/news/",
-    "https://www.businesswire.com/portal/site/home/news/industry/?vnsId=31367&service=Rss",  # Health/Med
+    "https://www.medicalnewstoday.com/rss",
 ]
 
 # =========================
@@ -87,7 +85,7 @@ BULLISH_HINTS = re.compile(r"\b(approval|beat|beats|above expectations|raises|up
 BEARISH_HINTS = re.compile(r"\b(downgrade|miss|misses|below expectations|cuts|recall|delay|halts?|bankrupt|chapter 11|investigation|probe|lawsuit|warning)\b", re.I)
 
 TICKER_PATTERNS = [
-    re.compile(r"\$([A-Z]{1,5}\d?)"),
+    re.compile(r"\\$([A-Z]{1,5}\d?)"),
     re.compile(r"\b(?:NASDAQ|NYSE|AMEX|OTC)[\s:]+([A-Z]{1,5}\d?)\b", re.I),
     re.compile(r"/symbol/([A-Z]{1,5}\d?)\b"),
 ]
@@ -122,8 +120,8 @@ def polarity(title, summary):
     return "neutral"
 
 def fmt_message(label, title, link, ticker):
-    icon = "🟩" if label == "bullish" else ("🟥" if label == "bearish" else "🟦")
-    tstr = f" — ${ticker}" if ticker else ""
+    icon = "\U0001F7E9" if label == "bullish" else ("\U0001F7E5" if label == "bearish" else "\U0001F7E6")
+    tstr = f" \u2014 ${ticker}" if ticker else ""
     return f"{icon} *{label.upper()}*{tstr}\n{title}\n{link}"
 
 # =========================
@@ -179,19 +177,25 @@ def flush_seen():
 # =========================
 def send(chat_id, text):
     try:
-        session.post(TG_API, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True}, timeout=10)
-    except Exception:
-        pass
+        resp = session.post(TG_API, json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }, timeout=10)
+        print("Telegram send response:", resp.status_code, resp.text)
+    except Exception as e:
+        print("Telegram send error:", e)
 
 def send_brief(market_items, biotech_items):
     if market_items:
-        header = "🌅 *Good morning!* Here are stocks & catalysts to watch:"
-        body = "\n".join([f"• {clean(title)[:120]} — ${ticker if ticker else '(no ticker)'}\n{link}" for (title, link, ticker) in market_items[:5]])
+        header = "\U0001F305 *Good morning!* Here are stocks & catalysts to watch:"
+        body = "\n".join([f"\u2022 {clean(title)[:120]} \u2014 ${ticker if ticker else '(no ticker)'}\n{link}" for (title, link, ticker) in market_items[:5]])
         send(TG_MARKET, f"{header}\n\n{body}")
 
     if biotech_items and TG_BIOTECH:
-        header = "🌅 *Biotech Brief:*"
-        body = "\n".join([f"• {clean(title)[:120]} — ${ticker if ticker else '(no ticker)'}\n{link}" for (title, link, ticker) in biotech_items[:5]])
+        header = "\U0001F305 *Biotech Brief:*"
+        body = "\n".join([f"\u2022 {clean(title)[:120]} \u2014 ${ticker if ticker else '(no ticker)'}\n{link}" for (title, link, ticker) in biotech_items[:5]])
         send(TG_BIOTECH, f"{header}\n\n{body}")
 
 # =========================
@@ -230,21 +234,28 @@ def scan_and_send(feeds, force_bio=False):
 # =========================
 #  Main loop
 # =========================
-def main():
-    global BRIEF_SENT_DATE
-    while True:
-        now = now_et()
-        if now.weekday() < 5 and now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
-            market_items = scan_and_send(FEEDS_MARKET)
-            biotech_items = scan_and_send(FEEDS_BIOTECH, force_bio=True)
-            send_brief(market_items, biotech_items)
-            BRIEF_SENT_DATE = now.date()
-            flush_seen()
-        if in_window(now):
-            scan_and_send(FEEDS_MARKET)
-            scan_and_send(FEEDS_BIOTECH, force_bio=True)
-            flush_seen()
-        time.sleep(60)
-
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--test" in sys.argv:
+        print("\n\u2705 Running in TEST mode: Sending one-time Morning Brief")
+        market_items = [("Test Market Headline", "https://example.com", "TEST")]
+        biotech_items = [("Test Biotech Headline", "https://example.com", "BIOT")]
+        print("Market items found:", market_items)
+        print("Biotech items found:", biotech_items)
+        send_brief(market_items, biotech_items)
+        flush_seen()
+        print("\n\u2705 Test brief sent")
+    else:
+        while True:
+            now = now_et()
+            if now.weekday() < 5 and now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
+                market_items = scan_and_send(FEEDS_MARKET)
+                biotech_items = scan_and_send(FEEDS_BIOTECH, force_bio=True)
+                send_brief(market_items, biotech_items)
+                BRIEF_SENT_DATE = now.date()
+                flush_seen()
+            if in_window(now):
+                scan_and_send(FEEDS_MARKET)
+                scan_and_send(FEEDS_BIOTECH, force_bio=True)
+                flush_seen()
+            time.sleep(60)
