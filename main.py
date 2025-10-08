@@ -1,210 +1,250 @@
+# main.py
 import os
 import re
 import time
+import json
 import html
-from datetime import datetime, time as dtime, timedelta
-from zoneinfo import ZoneInfo
-
-import requests
+import hashlib
 import feedparser
+import requests
 
-# ────────────────────────────
-# Telegram config (env vars)
-# ────────────────────────────
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")              # Market/general
-TG_BIOTECH_CHAT_ID = os.getenv("TG_BIOTECH_CHAT_ID")
+from datetime import datetime, time as dtime, timedelta
+from dateutil.tz import gettz
+from requests.adapters import HTTPAdapter, Retry
 
-if not TG_BOT_TOKEN or not TG_CHAT_ID:
-    raise SystemExit("Missing TG_BOT_TOKEN or TG_CHAT_ID environment variable(s).")
+# =========================
+#  Environment / Telegram
+# =========================
+TG_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_MARKET  = os.getenv("TG_CHAT_ID", "").strip()
+TG_BIOTECH = os.getenv("TG_BIOTECH_CHAT_ID", "").strip()
 
-API_URL = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+if not TG_TOKEN or not TG_MARKET:
+    raise SystemExit("Missing TG_BOT_TOKEN or TG_CHAT_ID env var.")
 
-# ────────────────────────────
-# Schedules / windows (ET)
-# ────────────────────────────
-ET = ZoneInfo("America/New_York")
-WINDOW_START = dtime(7, 0)    # 7:00 ET
-WINDOW_END   = dtime(20, 0)   # 20:00 ET
-DAILY_BRIEF_ET_HOUR = 9       # 9:00 ET
+TG_API = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-# ────────────────────────────
-# Feeds
-# ────────────────────────────
-# General/market movers (add/remove as you like)
+# HTTP session with retry
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+session.mount('https://', HTTPAdapter(max_retries=retries))
+
+# =========================
+#  Time window (ET)
+# =========================
+ET = gettz("America/New_York")
+WINDOW_START = dtime(7, 0)
+WINDOW_END   = dtime(20, 0)
+
+BRIEF_HOUR = 9
+BRIEF_SENT_DATE = None
+
+# =========================
+#  Ticker validation
+# =========================
+SYMBOLS_URLS = [
+    "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+    "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+]
+LAST_SYMBOLS_LOAD = None
+VALID_TICKERS = set()
+BLACKLIST = {"USD", "FOMC", "AI", "CEO", "ETF", "IPO", "EV", "FDA", "EPS", "GDP", "SEC", "MKT"}
+
+# =========================
+#  Feeds
+# =========================
 FEEDS_MARKET = [
-    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL,MSFT,TSLA,AMZN,NVDA,AMD,META,GOOGL,PLTR&region=US&lang=en-US",
-    "https://www.globenewswire.com/RssFeed/subjectcode/11-Market%20Updates/feedTitle/GlobeNewswire%20-%20Market%20Updates",
-    "https://www.prnewswire.com/rss/all-news.rss",
+    "https://www.businesswire.com/portal/site/home/news/industry/?vnsId=31372&service=Rss",
+    "https://www.globenewswire.com/RssFeed/org/All",
+    "https://www.prnewswire.com/rss/all-news-releases-list.rss",
+    "https://seekingalpha.com/market_currents.xml",
+    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL,MSFT,TSLA,AMZN,GOOGL,NVDA,SPY,QQQ&region=US&lang=en-US",
+    "https://www.cnbc.com/id/15839135/device/rss/rss.html",
 ]
 
-# Biotech-specific
 FEEDS_BIOTECH = [
     "https://www.fiercebiotech.com/rss.xml",
     "https://www.biopharmadive.com/feeds/news/",
+    "https://www.businesswire.com/portal/site/home/news/industry/?vnsId=31367&service=Rss",  # Health/Med
 ]
 
-# ────────────────────────────
-# Keyword rules
-# ────────────────────────────
-KEYWORDS = {
-    "bullish": [
-        "approval", "approves", "fast track", "breakthrough",
-        "partnership", "merger", "acquisition", "beats", "raises guidance",
-        "contract", "wins contract", "record revenue", "phase 3 meets",
-        "phase iii meets", "topline positive", "initiates buyback",
-    ],
-    "bearish": [
-        "halts", "hold placed", "bankruptcy", "lawsuit",
-        "guidance cut", "misses", "downgrade", "sec probe", "doj probe",
-        "data miss", "partial hold", "complete response letter", "crl",
-        "adverse event", "trial fails", "phase 3 fails", "delay",
-    ],
-}
+# =========================
+#  Regex patterns
+# =========================
+MOVE_KEYWORDS = [
+    "earnings", "guidance", "forecast", "raises outlook", "cuts outlook",
+    "merger", "acquisition", "buyout", "takeover", "strategic review",
+    "sec investigation", "doj", "lawsuit", "settlement",
+    "partnership", "contract", "approval", "clearance", "fda", "phase",
+    "bankruptcy", "chapter 11", "delisting", "split", "dividend",
+    "buyback", "downgrade", "upgrade", "initiated", "price target",
+    "cpi", "jobs report", "fomc", "rate cut", "rate hike", "treasury yields",
+    "halts", "resumes trading", "sec filing",
+]
+MOVE_RE = re.compile("|".join([re.escape(k) for k in MOVE_KEYWORDS]), re.I)
 
-# A small deny-list for obvious non-tickers that sometimes appear as "$MKT", "$NEWS", etc.
-FAKE_TICKERS = {
-    "MKT", "NEWS", "PR", "CEO", "FDA", "BIO", "AI", "ETF", "IPO", "SEC", "DOJ"
-}
+BULLISH_HINTS = re.compile(r"\b(approval|beat|beats|above expectations|raises|upgrade|record|surge|positive|wins? contract|buyback|raises outlook)\b", re.I)
+BEARISH_HINTS = re.compile(r"\b(downgrade|miss|misses|below expectations|cuts|recall|delay|halts?|bankrupt|chapter 11|investigation|probe|lawsuit|warning)\b", re.I)
 
-# Seen cache to avoid duplicates (title/link hash)
-SEEN = set()
+TICKER_PATTERNS = [
+    re.compile(r"\$([A-Z]{1,5}\d?)"),
+    re.compile(r"\b(?:NASDAQ|NYSE|AMEX|OTC)[\s:]+([A-Z]{1,5}\d?)\b", re.I),
+    re.compile(r"/symbol/([A-Z]{1,5}\d?)\b"),
+]
 
-# Daily brief throttling
-sent_brief_on_date = None
-
-# ────────────────────────────
-# Helpers
-# ────────────────────────────
-HTML_TAG_RE = re.compile(r"<[^>]+>")
-TICKER_RE = re.compile(
-    r"(?:\$(?P<dollar>[A-Z]{1,5})\b)|(?:\b(?:NASDAQ|NYSE|AMEX|OTC)[:\s]+(?P<xchg>[A-Z]{1,5})\b)"
-)
-
-def now_et() -> datetime:
+# =========================
+#  Utility functions
+# =========================
+def now_et():
     return datetime.now(ET)
 
-def in_window(dt: datetime) -> bool:
-    """Weekdays only, and between WINDOW_START–WINDOW_END ET."""
-    if dt.weekday() >= 5:  # 5=Sat, 6=Sun
-        return False
-    start = datetime.combine(dt.date(), WINDOW_START, tzinfo=ET)
-    end   = datetime.combine(dt.date(), WINDOW_END, tzinfo=ET)
-    return start <= dt <= end
+def in_window(ts):
+    return ts.weekday() < 5 and WINDOW_START <= ts.time() <= WINDOW_END
 
-def strip_html(s: str) -> str:
-    return HTML_TAG_RE.sub("", html.unescape(s or "")).strip()
+def clean(text):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html.unescape(text or "")).strip())
 
-def shorten(s: str, max_len: int = 140) -> str:
-    s = " ".join(s.split())
-    return (s[: max_len - 1] + "…") if len(s) > max_len else s
-
-def classify(text: str) -> str | None:
-    low = text.lower()
-    for w in KEYWORDS["bearish"]:
-        if w in low:
-            return "bearish"
-    for w in KEYWORDS["bullish"]:
-        if w in low:
-            return "bullish"
+def extract_valid_ticker(text):
+    for pattern in TICKER_PATTERNS:
+        for match in pattern.finditer(text):
+            t = match.group(1).upper()
+            if t in VALID_TICKERS and t not in BLACKLIST:
+                return t
     return None
 
-def extract_ticker(text: str) -> str | None:
-    """Return a plausible ticker or None."""
-    for m in TICKER_RE.finditer(text.upper()):
-        t = m.group("dollar") or m.group("xchg")
-        if not t:
-            continue
-        if len(t) > 5:
-            continue
-        if not t.isalpha():
-            continue
-        if t in FAKE_TICKERS:
-            continue
-        return t
-    return None
+def significant(title, summary):
+    return bool(MOVE_RE.search(f"{title} {summary}".lower()))
 
-def choose_channel(force_bio: bool) -> str:
-    if force_bio and TG_BIOTECH_CHAT_ID:
-        return TG_BIOTECH_CHAT_ID
-    return TG_CHAT_ID
+def polarity(title, summary):
+    blob = f"{title} {summary}"
+    if BEARISH_HINTS.search(blob): return "bearish"
+    if BULLISH_HINTS.search(blob): return "bullish"
+    return "neutral"
 
-def send_telegram(chat_id: str, text: str):
+def fmt_message(label, title, link, ticker):
+    icon = "🟩" if label == "bullish" else ("🟥" if label == "bearish" else "🟦")
+    tstr = f" — ${ticker}" if ticker else ""
+    return f"{icon} *{label.upper()}*{tstr}\n{title}\n{link}"
+
+# =========================
+#  Ticker loader
+# =========================
+def load_tickers(force=False):
+    global LAST_SYMBOLS_LOAD, VALID_TICKERS
+    if not force and LAST_SYMBOLS_LOAD and (now_et() - LAST_SYMBOLS_LOAD) < timedelta(hours=24):
+        return
+    tickers = set()
+    for url in SYMBOLS_URLS:
+        try:
+            r = session.get(url, timeout=10)
+            r.raise_for_status()
+            for line in r.text.splitlines():
+                if line and not line.startswith(("Symbol", "File")):
+                    sym = line.split("|", 1)[0].strip().upper()
+                    if 1 <= len(sym) <= 5:
+                        tickers.add(sym)
+        except Exception:
+            continue
+    if tickers:
+        VALID_TICKERS = tickers
+        LAST_SYMBOLS_LOAD = now_et()
+
+load_tickers(force=True)
+
+# =========================
+#  Deduplication
+# =========================
+SEEN_FILE = "/tmp/seen_news.json"
+try:
+    with open(SEEN_FILE, "r") as f:
+        SEEN = set(json.load(f))
+except Exception:
+    SEEN = set()
+
+def seen_key(link, title):
+    return hashlib.sha1(f"{link}|{title}".encode()).hexdigest()
+
+def remember(key):
+    SEEN.add(key)
+    if len(SEEN) % 50 == 0:
+        with open(SEEN_FILE, "w") as f:
+            json.dump(list(SEEN), f)
+
+def flush_seen():
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(SEEN), f)
+
+# =========================
+#  Telegram
+# =========================
+def send(chat_id, text):
     try:
-        requests.post(
-            API_URL,
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        )
+        session.post(TG_API, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True}, timeout=10)
     except Exception:
-        # Keep running on transient network issues
         pass
 
-def compose_line(tag: str, title: str, link: str, ticker: str | None) -> str:
-    icon = "🟥" if tag == "bearish" else "🟩"
-    head = shorten(title, 160)
-    if ticker:
-        return f"{icon} *{tag.upper()}* — ${ticker} | {head}\n{link}"
-    return f"{icon} *{tag.upper()}* | {head}\n{link}"
+def send_brief(market_items, biotech_items):
+    if market_items:
+        header = "🌅 *Good morning!* Here are stocks & catalysts to watch:"
+        body = "\n".join([f"• {clean(title)[:120]} — ${ticker if ticker else '(no ticker)'}\n{link}" for (title, link, ticker) in market_items[:5]])
+        send(TG_MARKET, f"{header}\n\n{body}")
 
-def scan_and_route(feeds: list[str], force_bio: bool = False):
-    """Read feeds, classify, clean, and send."""
+    if biotech_items and TG_BIOTECH:
+        header = "🌅 *Biotech Brief:*"
+        body = "\n".join([f"• {clean(title)[:120]} — ${ticker if ticker else '(no ticker)'}\n{link}" for (title, link, ticker) in biotech_items[:5]])
+        send(TG_BIOTECH, f"{header}\n\n{body}")
+
+# =========================
+#  Feed Scanner
+# =========================
+def scan_and_send(feeds, force_bio=False):
+    load_tickers()
+    brief_items = []
     for url in feeds:
-        d = feedparser.parse(url)
-        for e in d.entries[:12]:
-            title = strip_html(e.get("title", ""))
-            link  = e.get("link", "").strip()
+        try:
+            feed = feedparser.parse(url)
+        except Exception:
+            continue
+        for e in feed.entries[:12]:
+            title = clean(e.get("title", ""))
+            link = e.get("link", "").strip()
             if not title or not link:
                 continue
-
-            # de-dup
-            key = (title, link)
+            key = seen_key(link, title)
             if key in SEEN:
                 continue
-
-            tag = classify(title)
-            if not tag:
-                # Skip if neutral / not meaningful
+            summary = clean(e.get("summary", ""))
+            if not significant(title, summary):
                 continue
+            blob = f"{title} {summary} {link}"
+            ticker = extract_valid_ticker(blob)
+            chat = TG_BIOTECH if force_bio and TG_BIOTECH else TG_MARKET
+            label = polarity(title, summary)
+            msg = fmt_message(label, title, link, ticker)
+            send(chat, msg)
+            remember(key)
+            if len(brief_items) < 8:
+                brief_items.append((title, link, ticker))
+    return brief_items
 
-            ticker = extract_ticker(f"{title} {e.get('summary','')}")
-            msg = compose_line(tag, title, link, ticker)
-            send_telegram(choose_channel(force_bio), msg)
-            SEEN.add(key)
-            # light pacing
-            time.sleep(0.7)
-
-def build_morning_brief(now_dt: datetime) -> str:
-    weekday = now_dt.strftime("%a")
-    return f"🌅 *Good morning!* ({weekday} {now_dt:%b %d})\nTop catalysts today will post here during market hours."
-
-# ────────────────────────────
-# Main loop
-# ────────────────────────────
+# =========================
+#  Main loop
+# =========================
 def main():
-    global sent_brief_on_date
+    global BRIEF_SENT_DATE
     while True:
         now = now_et()
-
-        # Morning brief once/day on weekdays at ~9:00 ET
-        if now.weekday() < 5 and now.hour == DAILY_BRIEF_ET_HOUR and (sent_brief_on_date != now.date()):
-            send_telegram(TG_CHAT_ID, build_morning_brief(now))
-            sent_brief_on_date = now.date()
-
-        # Work only during weekday windows
+        if now.weekday() < 5 and now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
+            market_items = scan_and_send(FEEDS_MARKET)
+            biotech_items = scan_and_send(FEEDS_BIOTECH, force_bio=True)
+            send_brief(market_items, biotech_items)
+            BRIEF_SENT_DATE = now.date()
+            flush_seen()
         if in_window(now):
-            # Market/general
-            scan_and_route(FEEDS_MARKET, force_bio=False)
-            # Biotech route goes to biotech channel
-            scan_and_route(FEEDS_BIOTECH, force_bio=True)
-
-        # Sleep a bit; the feeds themselves throttle effectively
-        time.sleep(120)  # ~2 minutes
+            scan_and_send(FEEDS_MARKET)
+            scan_and_send(FEEDS_BIOTECH, force_bio=True)
+            flush_seen()
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
