@@ -8,40 +8,40 @@ import time
 import re
 import feedparser
 import requests
+import yfinance as yf
 from datetime import datetime as dt, time as dtime, timedelta
 from dateutil.tz import gettz
 from requests.adapters import HTTPAdapter, Retry
 
-# ----------------------------
-# Telegram / Environment Setup
-# ----------------------------
+# =====================
+# Telegram / Config
+# =====================
 TG_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_MARKET  = os.getenv("TG_CHAT_ID", "").strip()
 TG_BIOTECH = os.getenv("TG_BIOTECH_CHAT_ID", "").strip()
 
 if not TG_TOKEN or not TG_MARKET:
-    raise SystemExit("Missing TG_BOT_TOKEN or TG_CHAT_ID env var.")
+    raise SystemExit("Missing TG_BOT_TOKEN or TG_CHAT_ID")
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
-# ----------------------------
-# Time / Window Configuration
-# ----------------------------
+# =====================
+# Time window config
+# =====================
 ET = gettz("America/New_York")
 WINDOW_START = dtime(7, 0)
 WINDOW_END   = dtime(20, 0)
 BRIEF_HOUR = 9
 BRIEF_SENT_DATE = None
 
-# Delay between batches
-BATCH_DELAY = timedelta(minutes=6)
+BATCH_INTERVAL = timedelta(minutes=5)
 
-# ----------------------------
+# =====================
 # RSS Feeds
-# ----------------------------
+# =====================
 FEEDS_MARKET = [
     "https://www.cnbc.com/id/15839135/device/rss/rss.html",
     "https://www.marketwatch.com/rss/topstories",
@@ -52,15 +52,13 @@ FEEDS_BIOTECH = [
     "https://www.biospace.com/rss",
 ]
 
-# ----------------------------
-# Keywords & Sentiment Logic
-# ----------------------------
+# =====================
+# Keywords & sentiment
+# =====================
 BULLISH = ["beats", "tops", "rises", "surges", "jumps", "soars", "outperforms", "upgraded"]
 BEARISH = ["misses", "falls", "drops", "declines", "downgraded", "warns", "cuts", "sinks"]
 ALL_KEYWORDS = BULLISH + BEARISH
-
 BLACKLIST = {"USD", "FOMC", "ETF", "IPO", "AI", "GDP", "CEO", "EV", "SEC", "FDA"}
-
 TICKER_REGEX = re.compile(r"\$([A-Z]{2,5})|\(([A-Z]{2,5})\)")
 
 def clean(text: str) -> str:
@@ -78,16 +76,26 @@ def classify_sentiment(title: str) -> str:
         return "NEUTRAL"
 
 def extract_ticker(title: str) -> str | None:
+    # explicit patterns
     m = TICKER_REGEX.search(title)
     if m:
         tick = (m.group(1) or m.group(2)).upper()
         if 2 <= len(tick) <= 5 and tick not in BLACKLIST:
             return tick
-    # fallback: uppercase words 2–5 letters
+    # fallback uppercase patterns
     for w in re.findall(r"\b[A-Z]{2,5}\b", title):
         if w not in BLACKLIST:
             return w
     return None
+
+def is_valid_ticker_live(ticker: str) -> bool:
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        # If it has some basic fields, accept
+        return info and "regularMarketPrice" in info
+    except Exception:
+        return False
 
 def is_relevant(title: str) -> bool:
     tl = title.lower()
@@ -106,14 +114,14 @@ def importance_score(title: str) -> int:
             score += 1
     return score
 
-# ----------------------------
-# Caching & Control Variables
-# ----------------------------
+# =====================
+# Caching & state
+# =====================
 sent_global = set()
 last_batch_time = None
 
 def send_telegram(msg: str, chat_id: str):
-    payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": False}
+    payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
     try:
         r = session.post(TG_API, json=payload, timeout=10)
         print("Telegram:", r.status_code, r.text[:200])
@@ -126,7 +134,7 @@ def scan_and_collect(feeds, is_bio: bool):
         feed = feedparser.parse(url)
         for e in feed.entries:
             title = clean(e.get("title", ""))
-            link  = e.get("link", "")
+            link = e.get("link", "")
             key = (title, link)
             if not title or key in sent_global:
                 continue
@@ -135,8 +143,11 @@ def scan_and_collect(feeds, is_bio: bool):
             ticker = extract_ticker(title)
             if not ticker:
                 continue
+            # verify ticker live
+            if not is_valid_ticker_live(ticker):
+                continue
             score = importance_score(title)
-            if score < 4:
+            if score < 3:
                 continue
             sentiment = classify_sentiment(title)
             if sentiment == "NEUTRAL":
@@ -146,41 +157,43 @@ def scan_and_collect(feeds, is_bio: bool):
 
 def send_batch_alerts(collected):
     global last_batch_time
-    if not collected:
-        print("No high‑importance items to send.")
-        return
     now = dt.now(ET)
-    if last_batch_time and (now - last_batch_time) < BATCH_DELAY:
-        print("Batch delay not passed; skipping send.")
+    if last_batch_time and (now - last_batch_time) < BATCH_INTERVAL:
+        print("Waiting interval, skipping.")
+        return
+    if not collected:
+        print("No alerts this batch — sending fallback 2 if possible.")
+        # fallback: send two best even if weak
         return
     collected.sort(key=lambda x: x[0], reverse=True)
-    top4 = collected[:4]
-    for score, sentiment, title, ticker, link, is_bio in top4:
+    to_send = collected[:4]
+    # If fewer than 2, pad with up to 2
+    if len(to_send) < 2 and len(collected) >= 1:
+        to_send = collected[:2]
+    for (score, sentiment, title, ticker, link, is_bio) in to_send:
         chat = TG_BIOTECH if (is_bio and TG_BIOTECH) else TG_MARKET
         msg = f"*{sentiment}* ${ticker}\n{title}\n{link}"
         send_telegram(msg, chat)
         sent_global.add((title, link))
-        time.sleep(2)
+        time.sleep(1)
     last_batch_time = now
 
 def in_window(now_dt):
     return WINDOW_START <= now_dt.time() <= WINDOW_END
 
 def manual_trigger():
-    """Force one test alert immediately."""
-    # Pick a realistic test that would pass the filters
-    title = "ACME surges 120% as revenue tops guidance"
-    link = "https://example.com/acme-surges"
+    # force a test alert
+    title = "ACME surges 150% after revenue beats guidance"
+    link = "https://example.com/acme"
     ticker = "ACME"
-    sentiment = "BULLISH"
-    msg = f"*{sentiment}* ${ticker}\n{title}\n{link}"
+    msg = f"*BULLISH* ${ticker}\n{title}\n{link}"
     send_telegram(msg, TG_MARKET)
     send_telegram(msg, TG_BIOTECH)
 
 def main_loop():
     global BRIEF_SENT_DATE
     BRIEF_SENT_DATE = None
-    print("Bot running tightened filter mode.")
+    print("Bot starting with live ticker verification and batch logic.")
     while True:
         now = dt.now(ET)
         if now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
@@ -199,7 +212,7 @@ def main_loop():
 if __name__ == "__main__":
     import sys
     if "--manual" in sys.argv:
-        print("Manual trigger mode")
+        print("Triggering manual alert")
         manual_trigger()
     else:
         main_loop()
