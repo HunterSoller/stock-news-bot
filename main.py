@@ -193,3 +193,20 @@ if __name__ == "__main__":
         send_telegram(msg, TG_BIOTECH)
     else:
         main_loop()
+def manual_trigger():
+    # Example custom test that meets your filters
+    title = "Company X surges 50% after record earnings"
+    link = "https://example.com/record-earnings"
+    ticker = "COMPX"
+    sentiment = "BULLISH"
+    msg = f"*{sentiment}* ${ticker}\n{title}\n{link}"
+    send_telegram(msg, TG_MARKET)
+    # And also for biotech if you want:
+    send_telegram(msg, TG_BIOTECH)
+
+if __name__ == "__main__":
+    import sys
+    if "--manual" in sys.argv:
+        manual_trigger()
+    else:
+        main_loop()
