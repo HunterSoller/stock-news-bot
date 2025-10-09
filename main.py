@@ -1,5 +1,3 @@
-# main.py
-
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -118,14 +116,19 @@ def send_telegram(msg: str, chat_id: str):
     payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
     try:
         r = session.post(TG_API, json=payload, timeout=10)
-        print("Telegram:", r.status_code, r.text[:200])
+        print(f"[Telegram] chat_id={chat_id}, status={r.status_code}, resp={r.text}")
     except Exception as e:
-        print("Telegram send error:", e)
+        print("[Telegram send error]", e)
 
 def scan_and_collect(feeds, is_bio: bool):
     items = []
     for url in feeds:
-        feed = feedparser.parse(url)
+        try:
+            feed = feedparser.parse(url)
+        except Exception as e:
+            print(f"Error parsing feed {url}: {e}")
+            continue
+
         for e in feed.entries:
             title = clean(e.get("title", ""))
             link = e.get("link", "")
@@ -137,11 +140,10 @@ def scan_and_collect(feeds, is_bio: bool):
             ticker = extract_ticker(title)
             if not ticker:
                 continue
-            # temporarily skip live verification to get more alerts
+            # (Optionally skip live check) — you already disabled this
             # if not is_valid_ticker_live(ticker):
             #     continue
             score = importance_score(title)
-            # lower threshold
             if score < 1:
                 continue
             sentiment = classify_sentiment(title)
@@ -154,21 +156,30 @@ def send_batch_alerts(collected):
     global last_batch_time
     now = dt.now(ET)
     if last_batch_time and (now - last_batch_time) < BATCH_INTERVAL:
-        print("Waiting interval, skipping.")
+        print("Waiting interval, skipping this batch.")
         return
     if not collected:
-        print("No alerts this batch — sending fallback 2 if possible.")
+        print("No alerts this batch — sending fallback message.")
+        # Send a simple “I'm alive” or status message to confirm bot is active
+        msg = "🟢 Bot alive but no alerts this interval."
+        send_telegram(msg, TG_MARKET)
+        if TG_BIOTECH:
+            send_telegram(msg, TG_BIOTECH)
+        last_batch_time = now
         return
+
     collected.sort(key=lambda x: x[0], reverse=True)
     to_send = collected[:4]
     if len(to_send) < 2 and len(collected) >= 1:
         to_send = collected[:2]
+
     for (score, sentiment, title, ticker, link, is_bio) in to_send:
         chat = TG_BIOTECH if (is_bio and TG_BIOTECH) else TG_MARKET
         msg = f"*{sentiment}* ${ticker}\n{title}\n{link}"
         send_telegram(msg, chat)
         sent_global.add((title, link))
-        time.sleep(1)
+        time.sleep(1)  # slight delay to avoid hitting Telegram rate limits
+
     last_batch_time = now
 
 def in_window(now_dt):
@@ -180,7 +191,8 @@ def manual_trigger():
     ticker = "TEST"
     msg = f"*BULLISH* ${ticker}\n{title}\n{link}"
     send_telegram(msg, TG_MARKET)
-    send_telegram(msg, TG_BIOTECH)
+    if TG_BIOTECH:
+        send_telegram(msg, TG_BIOTECH)
 
 def main_loop():
     global BRIEF_SENT_DATE
@@ -188,17 +200,24 @@ def main_loop():
     print("Bot live with relaxed filters.")
     while True:
         now = dt.now(ET)
-        if now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
-            m = scan_and_collect(FEEDS_MARKET, False)
-            b = scan_and_collect(FEEDS_BIOTECH, True)
-            send_batch_alerts(m + b)
-            BRIEF_SENT_DATE = now.date()
-        elif in_window(now):
-            m = scan_and_collect(FEEDS_MARKET, False)
-            b = scan_and_collect(FEEDS_BIOTECH, True)
-            send_batch_alerts(m + b)
-        else:
-            time.sleep(600)
+        try:
+            if now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
+                print("== Brief hour trigger ==")
+                m = scan_and_collect(FEEDS_MARKET, False)
+                b = scan_and_collect(FEEDS_BIOTECH, True)
+                send_batch_alerts(m + b)
+                BRIEF_SENT_DATE = now.date()
+            elif in_window(now):
+                # print status
+                print(f"In trading window: {now.time()}")
+                m = scan_and_collect(FEEDS_MARKET, False)
+                b = scan_and_collect(FEEDS_BIOTECH, True)
+                send_batch_alerts(m + b)
+            else:
+                print(f"Outside window ({now.time()}), sleeping longer.")
+                time.sleep(600)
+        except Exception as e:
+            print("Error in main_loop:", e)
         time.sleep(120)
 
 if __name__ == "__main__":
