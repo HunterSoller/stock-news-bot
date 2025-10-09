@@ -76,13 +76,11 @@ def classify_sentiment(title: str) -> str:
         return "NEUTRAL"
 
 def extract_ticker(title: str) -> str | None:
-    # explicit patterns
     m = TICKER_REGEX.search(title)
     if m:
         tick = (m.group(1) or m.group(2)).upper()
         if 2 <= len(tick) <= 5 and tick not in BLACKLIST:
             return tick
-    # fallback uppercase patterns
     for w in re.findall(r"\b[A-Z]{2,5}\b", title):
         if w not in BLACKLIST:
             return w
@@ -92,7 +90,6 @@ def is_valid_ticker_live(ticker: str) -> bool:
     try:
         t = yf.Ticker(ticker)
         info = t.info
-        # If it has some basic fields, accept
         return info and "regularMarketPrice" in info
     except Exception:
         return False
@@ -114,9 +111,6 @@ def importance_score(title: str) -> int:
             score += 1
     return score
 
-# =====================
-# Caching & state
-# =====================
 sent_global = set()
 last_batch_time = None
 
@@ -143,10 +137,11 @@ def scan_and_collect(feeds, is_bio: bool):
             ticker = extract_ticker(title)
             if not ticker:
                 continue
-            # verify ticker live
-            if not is_valid_ticker_live(ticker):
-                continue
+            # temporarily skip live verification to get more alerts
+            # if not is_valid_ticker_live(ticker):
+            #     continue
             score = importance_score(title)
+            # lower threshold
             if score < 1:
                 continue
             sentiment = classify_sentiment(title)
@@ -163,11 +158,9 @@ def send_batch_alerts(collected):
         return
     if not collected:
         print("No alerts this batch — sending fallback 2 if possible.")
-        # fallback: send two best even if weak
         return
     collected.sort(key=lambda x: x[0], reverse=True)
     to_send = collected[:4]
-    # If fewer than 2, pad with up to 2
     if len(to_send) < 2 and len(collected) >= 1:
         to_send = collected[:2]
     for (score, sentiment, title, ticker, link, is_bio) in to_send:
@@ -182,10 +175,9 @@ def in_window(now_dt):
     return WINDOW_START <= now_dt.time() <= WINDOW_END
 
 def manual_trigger():
-    # force a test alert
-    title = "ACME surges 150% after revenue beats guidance"
-    link = "https://example.com/acme"
-    ticker = "ACME"
+    title = "TESTCO surges after revenue beats estimates"
+    link = "https://example.com/testco"
+    ticker = "TEST"
     msg = f"*BULLISH* ${ticker}\n{title}\n{link}"
     send_telegram(msg, TG_MARKET)
     send_telegram(msg, TG_BIOTECH)
@@ -193,7 +185,7 @@ def manual_trigger():
 def main_loop():
     global BRIEF_SENT_DATE
     BRIEF_SENT_DATE = None
-    print("Bot starting with live ticker verification and batch logic.")
+    print("Bot live with relaxed filters.")
     while True:
         now = dt.now(ET)
         if now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
@@ -212,7 +204,7 @@ def main_loop():
 if __name__ == "__main__":
     import sys
     if "--manual" in sys.argv:
-        print("Triggering manual alert")
+        print("Manual trigger mode")
         manual_trigger()
     else:
         main_loop()
