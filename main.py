@@ -101,26 +101,24 @@ def send_telegram(msg, chat_id):
     except Exception as e:
         print("[ERROR] Telegram send failed:", e)
 
-def scan_feeds():
+def scan_feed_list(feed_list):
     items = []
-    feeds = [(FEEDS_MARKET, False), (FEEDS_BIOTECH, True)]
-    for feed_list, is_bio in feeds:
-        for url in feed_list:
-            feed = feedparser.parse(url)
-            for e in feed.entries:
-                title = clean(e.get("title", ""))
-                link = e.get("link", "")
-                key = (title, link)
-                if not title or key in sent_global:
-                    continue
-                ticker = extract_ticker(title)
-                if not ticker:
-                    continue
-                sentiment = classify_sentiment(title)
-                if sentiment == "NEUTRAL":
-                    continue
-                score = importance_score(title)
-                items.append((score, sentiment, title, ticker, link))
+    for url in feed_list:
+        feed = feedparser.parse(url)
+        for e in feed.entries:
+            title = clean(e.get("title", ""))
+            link = e.get("link", "")
+            key = (title, link)
+            if not title or key in sent_global:
+                continue
+            ticker = extract_ticker(title)
+            if not ticker:
+                continue
+            sentiment = classify_sentiment(title)
+            if sentiment == "NEUTRAL":
+                continue
+            score = importance_score(title)
+            items.append((score, sentiment, title, ticker, link))
     return items
 
 def send_batch():
@@ -130,27 +128,31 @@ def send_batch():
         print("[WAIT] Too soon. Skipping batch.")
         return
 
-    headlines = scan_feeds()
-    if not headlines:
-        print("[INFO] No headlines, skipping.")
-        return
+    market_items = scan_feed_list(FEEDS_MARKET)
+    biotech_items = scan_feed_list(FEEDS_BIOTECH)
 
-    headlines.sort(key=lambda x: x[0], reverse=True)
-    top = headlines[:5]
+    market_items.sort(key=lambda x: x[0], reverse=True)
+    biotech_items.sort(key=lambda x: x[0], reverse=True)
 
-    for score, sentiment, title, ticker, link in top:
-        sector = get_sector(ticker)
-        is_bio = any(x in sector for x in ["biotech", "pharma", "health"])
-        chat = TG_BIOTECH if is_bio and TG_BIOTECH else TG_MARKET
+    top_market = market_items[:5]
+    top_biotech = biotech_items[:5]
+
+    for score, sentiment, title, ticker, link in top_market:
         msg = f"*{sentiment}* ${ticker}\n{title}\n{link}"
-        send_telegram(msg, chat)
+        send_telegram(msg, TG_MARKET)
+        sent_global.add((title, link))
+        time.sleep(1)
+
+    for score, sentiment, title, ticker, link in top_biotech:
+        msg = f"*{sentiment}* ${ticker}\n{title}\n{link}"
+        send_telegram(msg, TG_BIOTECH)
         sent_global.add((title, link))
         time.sleep(1)
 
     last_batch_time = now
 
 def main():
-    print("[STARTED] Bot active. Pulling every 6 minutes.")
+    print("[STARTED] Bot active. Sending 5 alerts per channel every 6 minutes.")
     while True:
         try:
             send_batch()
