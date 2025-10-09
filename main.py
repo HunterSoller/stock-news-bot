@@ -147,7 +147,7 @@ def scan_and_collect(feeds, is_bio: bool):
             if not is_valid_ticker_live(ticker):
                 continue
             score = importance_score(title)
-            if score < 3:
+            if score < 1:
                 continue
             sentiment = classify_sentiment(title)
             if sentiment == "NEUTRAL":
