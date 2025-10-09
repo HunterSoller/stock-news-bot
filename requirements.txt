@@ -2,4 +2,4 @@ requests
 feedparser
 python-dateutil
 python-dotenv
-yfinance
+yfinance==0.2.26
