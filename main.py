@@ -7,6 +7,7 @@ import re
 import feedparser
 import requests
 import yfinance as yf
+import sys
 from datetime import datetime as dt, timedelta, time as dtime
 from dateutil.tz import gettz
 from requests.adapters import HTTPAdapter, Retry
@@ -44,7 +45,7 @@ FEEDS_BIOTECH = [
 BULLISH = ["beats", "tops", "rises", "surges", "jumps", "soars", "outperforms", "upgraded", "merger", "acquisition"]
 BEARISH = ["misses", "falls", "drops", "declines", "downgraded", "warns", "cuts", "sinks", "bankruptcy", "lawsuit"]
 ALL_KEYWORDS = BULLISH + BEARISH
-TICKER_REGEX = re.compile(r"\\$([A-Z]{2,5})|\\(([A-Z]{2,5})\\)")
+TICKER_REGEX = re.compile(r"\$([A-Z]{2,5})|\(([A-Z]{2,5})\)")
 BLACKLIST = {"USD", "FOMC", "ETF", "IPO", "AI", "GDP", "CEO", "EV", "SEC", "FDA"}
 
 sent_global = set()
@@ -60,7 +61,7 @@ def extract_ticker(title):
         t = (m.group(1) or m.group(2)).upper()
         if 2 <= len(t) <= 5 and t not in BLACKLIST:
             return t
-    for w in re.findall(r"\\b[A-Z]{2,5}\\b", title):
+    for w in re.findall(r"\b[A-Z]{2,5}\b", title):
         if w not in BLACKLIST:
             return w
     return None
@@ -101,9 +102,11 @@ def send_telegram(msg, chat_id):
     payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
     try:
         r = session.post(TG_API, json=payload, timeout=10)
-        print(f"[Telegram] {chat_id}: {r.status_code}")
+        print(f"[SENT] To {chat_id}: {msg[:100]}...")
+        sys.stdout.flush()
     except Exception as e:
         print("[ERROR] Telegram send failed:", e)
+        sys.stdout.flush()
 
 def scan_feed_list(feed_list):
     items = []
@@ -171,26 +174,32 @@ def is_weekday(now):
 def main():
     global BRIEF_SENT_DATE
     print("[STARTED] Bot live 7am–8pm ET, Mon–Fri.")
+    sys.stdout.flush()
     while True:
         now = dt.now(ET)
         try:
             if is_weekday(now):
                 if now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
                     print("[MORNING] Sending digest.")
+                    sys.stdout.flush()
                     send_morning_digest()
                     BRIEF_SENT_DATE = now.date()
 
                 if in_window(now):
                     print("[ACTIVE] Sending top alerts.")
+                    sys.stdout.flush()
                     send_top_alerts()
                 else:
                     print(f"[SLEEP] Outside trading window at {now.time()}.")
+                    sys.stdout.flush()
                     time.sleep(600)
             else:
                 print(f"[SLEEP] Weekend ({now.strftime('%A')}). Sleeping 1h.")
+                sys.stdout.flush()
                 time.sleep(3600)
         except Exception as e:
             print("[ERROR] Main loop exception:", e)
+            sys.stdout.flush()
         time.sleep(360)
 
 if __name__ == "__main__":
