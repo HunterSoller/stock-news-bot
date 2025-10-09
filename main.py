@@ -25,6 +25,10 @@ retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503,
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 ET = gettz("America/New_York")
+WINDOW_START = dtime(7, 0)
+WINDOW_END = dtime(20, 0)
+BRIEF_HOUR = 9
+BRIEF_SENT_DATE = None
 
 BATCH_INTERVAL = timedelta(minutes=6)
 FEEDS_MARKET = [
@@ -121,13 +125,7 @@ def scan_feed_list(feed_list):
             items.append((score, sentiment, title, ticker, link))
     return items
 
-def send_batch():
-    global last_batch_time
-    now = dt.now(ET)
-    if last_batch_time and now - last_batch_time < BATCH_INTERVAL:
-        print("[WAIT] Too soon. Skipping batch.")
-        return
-
+def send_top_alerts():
     market_items = scan_feed_list(FEEDS_MARKET)
     biotech_items = scan_feed_list(FEEDS_BIOTECH)
 
@@ -149,13 +147,48 @@ def send_batch():
         sent_global.add((title, link))
         time.sleep(1)
 
-    last_batch_time = now
+def send_morning_digest():
+    all_items = scan_feed_list(FEEDS_MARKET + FEEDS_BIOTECH)
+    all_items.sort(key=lambda x: x[0], reverse=True)
+    top_items = all_items[:4]
+
+    if not top_items:
+        return
+
+    message = "🌅 *Good Morning!* Here are 4 stocks to watch today:\n\n"
+    for score, sentiment, title, ticker, link in top_items:
+        message += f"*{sentiment}* ${ticker}: {title}\n{link}\n\n"
+    send_telegram(message.strip(), TG_MARKET)
+    if TG_BIOTECH:
+        send_telegram(message.strip(), TG_BIOTECH)
+
+def in_window(now):
+    return WINDOW_START <= now.time() <= WINDOW_END
+
+def is_weekday(now):
+    return now.weekday() < 5  # Mon–Fri
 
 def main():
-    print("[STARTED] Bot active. Sending 5 alerts per channel every 6 minutes.")
+    global BRIEF_SENT_DATE
+    print("[STARTED] Bot live 7am–8pm ET, Mon–Fri.")
     while True:
+        now = dt.now(ET)
         try:
-            send_batch()
+            if is_weekday(now):
+                if now.hour == BRIEF_HOUR and BRIEF_SENT_DATE != now.date():
+                    print("[MORNING] Sending digest.")
+                    send_morning_digest()
+                    BRIEF_SENT_DATE = now.date()
+
+                if in_window(now):
+                    print("[ACTIVE] Sending top alerts.")
+                    send_top_alerts()
+                else:
+                    print(f"[SLEEP] Outside trading window at {now.time()}.")
+                    time.sleep(600)
+            else:
+                print(f"[SLEEP] Weekend ({now.strftime('%A')}). Sleeping 1h.")
+                time.sleep(3600)
         except Exception as e:
             print("[ERROR] Main loop exception:", e)
         time.sleep(360)
