@@ -3,3 +3,5 @@ feedparser
 python-dateutil
 python-dotenv
 yfinance==0.2.26
+openai
+beautifulsoup4

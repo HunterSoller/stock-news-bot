@@ -1,0 +1,10 @@
+[BOOT] Advanced Stock News Bot starting...
+[CONFIG] Scan interval: 60s
+[CONFIG] Report interval: 300s
+[CONFIG] Event retention: 5 minutes
+[SCAN] Starting news scan at 20:13:29
+[SCAN] Processing feed: https://www.cnbc.com/id/15839135/device/rss/rss.html
+[FETCH] Getting article content: H&M shares jump 8% on third-quarter sales beat as ...
+[ANALYZE] Processing: H&M shares jump 8% on third-quarter sales beat as ...
+
+[SHUTDOWN] Bot stopped by user
