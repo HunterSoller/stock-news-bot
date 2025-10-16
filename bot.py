@@ -47,7 +47,7 @@ NEWS_FEEDS = [
 
 # Bot settings
 SCAN_INTERVAL_SECONDS = 60  # Scan every minute
-REPORT_INTERVAL_SECONDS = 300  # Report every 5 minutes
+REPORT_INTERVAL_SECONDS = 600  # [CHANGE] Report every 10 minutes
 EVENT_RETENTION_MINUTES = 5  # Keep events for 5 minutes
 MAX_EVENTS_PER_SCAN = 20  # Maximum events to process per scan
 MAX_EVENTS_TO_STORE = 100  # Maximum events to keep in memory
@@ -91,8 +91,8 @@ class NewsEvent:
     ticker: str
     article_content: str  # Full article text
     importance_reasons: List[str]
-    sentiment: str  # BULLISH, BEARISH, or NEUTRAL
-    confidence_score: float  # 0.0 to 1.0
+    sentiment: str  # BULLISH or BEARISH
+    confidence_score: float  # retained for backward-compatibility; unused in output
     timestamp: datetime
     source_url: str
     source_feed: str
@@ -120,7 +120,7 @@ class NewsEvent:
             article_content=data['article_content'],
             importance_reasons=data['importance_reasons'],
             sentiment=data['sentiment'],
-            confidence_score=data['confidence_score'],
+            confidence_score=data.get('confidence_score', 0.0),
             timestamp=datetime.fromisoformat(data['timestamp']),
             source_url=data['source_url'],
             source_feed=data['source_feed']
@@ -481,14 +481,14 @@ def validate_ticker(ticker: str) -> bool:
         return False
 
 def analyze_news_with_chatgpt(headline: str, ticker: str, article_content: str) -> Dict[str, any]:
-    """Use ChatGPT to analyze news sentiment and importance using full article content"""
+    """[CHANGE] Analyze sentiment (BULLISH/BEARISH) with a one-line reason; ignore neutral"""
     
     # Truncate article content if too long to avoid token limits
     if len(article_content) > 3000:
         article_content = article_content[:3000] + "..."
     
     prompt = f"""
-Analyze this stock news article for trading relevance:
+You are a stock market analyst. Read the headline and article, then decide if this is BULLISH or BEARISH for the stock price in the short term. Ignore neutral. Output only JSON with 'sentiment' and a short one-line 'reason'.
 
 Headline: "{headline}"
 Stock Ticker: {ticker}
@@ -496,84 +496,43 @@ Stock Ticker: {ticker}
 Full Article Content:
 {article_content}
 
-Please provide:
-1. Sentiment: BULLISH, BEARISH, or NEUTRAL
-2. Confidence Score: 0.0 to 1.0 (how confident you are in the sentiment)
-3. Importance Reasons: List 2-4 specific reasons why this news is important for traders
-
-Format your response as JSON:
-{{
-    "sentiment": "BULLISH/BEARISH/NEUTRAL",
-    "confidence_score": 0.0-1.0,
-    "importance_reasons": ["reason1", "reason2", "reason3"]
-}}
-
-Focus on:
-- Earnings impact and financial performance
-- Regulatory changes and approvals
-- Market-moving events and catalysts
-- Competitive advantages/threats
-- Strategic announcements (mergers, partnerships, etc.)
-- Product launches or delays
-- Management changes
-- Industry trends affecting the company
-- Analyst upgrades/downgrades mentioned
-- Revenue/profit guidance changes
-
-Consider the full context of the article, not just the headline. Look for specific details, numbers, quotes, and implications that affect the stock's trading prospects.
+Output ONLY valid JSON like: {{"sentiment": "BULLISH" or "BEARISH", "reason": "short 1-line reason"}}
 """
     
     response = call_chatgpt_api(prompt)
     if not response:
-        return {
-            "sentiment": "NEUTRAL",
-            "confidence_score": 0.0,
-            "importance_reasons": ["Unable to analyze"]
-        }
+        return {"sentiment": "NEUTRAL", "reason": "Unable to analyze"}
     
     try:
-        # Try to extract JSON from response
         json_start = response.find('{')
         json_end = response.rfind('}') + 1
         if json_start != -1 and json_end != -1:
-            json_str = response[json_start:json_end]
-            result = json.loads(json_str)
-            
-            # Validate and clean the response
-            sentiment = result.get('sentiment', 'NEUTRAL').upper()
-            if sentiment not in ['BULLISH', 'BEARISH', 'NEUTRAL']:
-                sentiment = 'NEUTRAL'
-            
-            confidence = float(result.get('confidence_score', 0.0))
-            confidence = max(0.0, min(1.0, confidence))  # Clamp to 0-1
-            
-            reasons = result.get('importance_reasons', ['Unable to analyze'])
-            if not isinstance(reasons, list):
-                reasons = [str(reasons)]
-            
-            return {
-                "sentiment": sentiment,
-                "confidence_score": confidence,
-                "importance_reasons": reasons
-            }
-    
-    except (json.JSONDecodeError, ValueError, KeyError) as e:
-        print(f"[ERROR] Failed to parse ChatGPT response: {e}")
-        print(f"[DEBUG] Response was: {response}")
-    
-    # Fallback response
-    return {
-        "sentiment": "NEUTRAL",
-        "confidence_score": 0.0,
-        "importance_reasons": ["Analysis failed"]
-    }
+            parsed = json.loads(response[json_start:json_end])
+            sentiment = str(parsed.get('sentiment', '')).upper()
+            reason = str(parsed.get('reason', '')).strip()
+            if sentiment not in ["BULLISH", "BEARISH"]:
+                sentiment = "NEUTRAL"
+            if not reason:
+                reason = "No reason provided"
+            return {"sentiment": sentiment, "reason": reason}
+    except Exception as e:
+        logging.error(f"[ANALYZE] Parse error: {e}")
+    return {"sentiment": "NEUTRAL", "reason": "Analysis failed"}
 
 def select_top_events_with_chatgpt(events: List[NewsEvent]) -> List[NewsEvent]:
-    """Use ChatGPT to select the top 5 most promising trading events"""
+    """[CHANGE] Use ChatGPT to rank top 5 actionable events; dedupe by ticker+headline"""
     
     if len(events) <= 5:
         return events
     
+    # Deduplicate by ticker + normalized headline snippet [CHANGE]
+    unique_map = {}
+    for ev in events:
+        key = (ev.ticker, ev.headline.lower().strip())
+        if key not in unique_map:
+            unique_map[key] = ev
+    events = list(unique_map.values())
+
     # Prepare event summaries for ChatGPT
     event_summaries = []
     for i, event in enumerate(events):
@@ -585,29 +544,22 @@ Event {i+1}:
 - Headline: {event.headline}
 - Ticker: {event.ticker}
 - Sentiment: {event.sentiment}
-- Confidence: {event.confidence_score:.2f}
-- Reasons: {', '.join(event.importance_reasons)}
+- Reason: {', '.join(event.importance_reasons)}
 - Content Preview: {content_preview}
 """
         event_summaries.append(summary)
     
     prompt = f"""
-You are a professional trader selecting the most promising stock news events for trading opportunities.
+You are a professional trader. Given these analyzed stock news events, choose the top 5 most actionable, unique, and important for traders. Return ONLY the event numbers (1-{len(events)}) separated by commas, ranked by importance.
 
-Here are {len(events)} recent news events:
+Consider:
+- Strength of sentiment (strong bullish/bearish)
+- Market-moving importance
+- Clarity of trading impact
+- Uniqueness (avoid duplicates)
 
+Events:
 {chr(10).join(event_summaries)}
-
-Select the TOP 5 most promising events for trading based on:
-1. High confidence sentiment (bullish or bearish)
-2. Significant market impact potential
-3. Clear trading implications
-4. Recent timing relevance
-
-Respond with ONLY the event numbers (1-{len(events)}) separated by commas, in order of priority.
-Example: 3,7,1,12,5
-
-Focus on events that provide clear trading signals - either strong bullish or bearish sentiment with high confidence.
 """
     
     response = call_chatgpt_api(prompt, max_tokens=100)
@@ -629,17 +581,17 @@ Focus on events that provide clear trading signals - either strong bullish or be
         selected_events = [events[i] for i in selected_indices[:5]]
         
         if len(selected_events) < 5:
-            # Fill remaining slots with highest confidence events not already selected
+            # Fill remaining slots arbitrarily by recency [CHANGE]
             remaining_events = [events[i] for i in range(len(events)) if i not in selected_indices]
-            remaining_events.sort(key=lambda x: x.confidence_score, reverse=True)
+            remaining_events.sort(key=lambda x: x.timestamp, reverse=True)
             selected_events.extend(remaining_events[:5-len(selected_events)])
         
         return selected_events
     
     except Exception as e:
         print(f"[ERROR] Failed to parse ChatGPT selection: {e}")
-        # Fallback: return top 5 by confidence score
-        return sorted(events, key=lambda x: x.confidence_score, reverse=True)[:5]
+        # Fallback: return top 5 by recency [CHANGE]
+        return sorted(events, key=lambda x: x.timestamp, reverse=True)[:5]
 
 def validate_telegram_config():
     """Validate Telegram configuration"""
@@ -730,14 +682,18 @@ def scan_news_feeds() -> List[NewsEvent]:
                 print(f"[ANALYZE] Processing: {headline[:50]}...")
                 analysis = analyze_news_with_chatgpt(headline, ticker, article_content)
                 
+                # Skip neutral now [CHANGE]
+                if analysis.get('sentiment') == 'NEUTRAL':
+                    continue
+
                 # Create news event
                 event = NewsEvent(
                     headline=headline,
                     ticker=ticker,
                     article_content=article_content,
-                    importance_reasons=analysis['importance_reasons'],
+                    importance_reasons=[analysis.get('reason', 'Analysis')],
                     sentiment=analysis['sentiment'],
-                    confidence_score=analysis['confidence_score'],
+                    confidence_score=0.0,
                     timestamp=datetime.now(),
                     source_url=link,
                     source_feed=feed_url
@@ -821,12 +777,11 @@ def send_wake_up_report():
     top_events = sorted(recent, key=lambda x: x.confidence_score, reverse=True)[:5]
 
     # Format message per spec (cleaner style)
-    message = "🌅 *Good Morning! Top Stocks to Watch*\n\n"
+    message = "🌅 Good Morning! Top Stocks to Watch:\n\n"
     for i, event in enumerate(top_events, 1):
         sentiment_emoji = "🟢" if event.sentiment == "BULLISH" else "🔴"
-        message += f"{i}. {sentiment_emoji} *{event.sentiment}* ${event.ticker}\n"
-        message += f"   {event.headline}\n"
-        message += f"   Confidence: {event.confidence_score:.0%}\n"
+        reason = event.importance_reasons[0] if event.importance_reasons else event.headline
+        message += f"{i}. {sentiment_emoji} *{event.sentiment}* ${event.ticker} – {reason}  \n"
         message += f"   [Source]({event.source_url})\n\n"
 
     message += f"_Generated at {now.strftime('%H:%M')}_"
@@ -845,10 +800,12 @@ def send_trading_report():
         print("[REPORT] No events to report")
         return
 
-    # Filter for bullish/bearish, valid tickers, and exclude previously sent headlines [CHANGE]
+    # Filter last 10 minutes, bullish/bearish, valid tickers, exclude already sent [CHANGE]
+    cutoff = datetime.now() - timedelta(seconds=REPORT_INTERVAL_SECONDS)
     eligible = [
         e for e in list(news_events)
-        if e.sentiment in ("BULLISH", "BEARISH")
+        if e.timestamp >= cutoff
+        and e.sentiment in ("BULLISH", "BEARISH")
         and validate_ticker(e.ticker)
         and e.headline not in sent_headlines_sent
     ]
@@ -856,17 +813,18 @@ def send_trading_report():
         logging.info("[REPORT] No eligible new events to send")
         return
 
-    top_events = sorted(eligible, key=lambda x: x.confidence_score, reverse=True)[:5]
+    # Use ChatGPT ranking to pick top 5 [CHANGE]
+    top_events = select_top_events_with_chatgpt(eligible)
     if not top_events:
         logging.info("[REPORT] No events selected for report")
         return
 
-    message = f"📈 *Top 5 Stock Events – Next Moves*\n\n"
+    message = f"📈 Top 5 Stocks:\n\n"
     for i, event in enumerate(top_events, 1):
         sentiment_emoji = "🟢" if event.sentiment == "BULLISH" else "🔴"
-        message += f"{i}. {sentiment_emoji} *{event.sentiment}* ${event.ticker}\n"
-        message += f"   {event.headline}\n"
-        message += f"   Confidence: {event.confidence_score:.0%}\n"
+        # One-line reason derived from importance_reasons[0]
+        reason = event.importance_reasons[0] if event.importance_reasons else event.headline
+        message += f"{i}. {sentiment_emoji} *{event.sentiment}* ${event.ticker} – {reason}  \n"
         message += f"   [Source]({event.source_url})\n\n"
 
     message += f"_Report generated at {datetime.now().strftime('%H:%M:%S')}_"
