@@ -261,10 +261,9 @@ def check_mode_switch():
         logging.info(f"[MODE_SWITCH] {old_mode} -> {current_mode}")  # [CHANGE] log mode switch
         
         if old_mode == "SLEEP" and new_mode == "NORMAL":
-            # Waking up - send wake-up report
+            # [CHANGE] Waking up - do not send report here; only at 7 AM
             print(f"🌅 [WAKE_UP] Bot waking up! Collected {sleep_events_collected} events during sleep")
-            logging.info(f"[WAKE_UP] Waking up with {sleep_events_collected} events collected")  # [CHANGE]
-            send_wake_up_report()
+            logging.info(f"[WAKE_UP] Waking up with {sleep_events_collected} events collected (no auto send)")
             sleep_events_collected = 0
         elif old_mode == "NORMAL" and new_mode == "SLEEP":
             # Going to sleep
@@ -799,7 +798,7 @@ def view_current_events():
         print("-" * 80)
 
 def send_wake_up_report():
-    """[CHANGE] Send Good Morning report at wake-up with top 5 bullish/bearish since last wake-up"""
+    """[CHANGE] Send Good Morning report at 7 AM with top 5 bullish/bearish since last wake-up"""
     global last_wake_up_time
     if not news_events:
         print("[WAKE_UP] No events to report")
@@ -821,14 +820,14 @@ def send_wake_up_report():
     # Top 5 by confidence
     top_events = sorted(recent, key=lambda x: x.confidence_score, reverse=True)[:5]
 
-    # Format message per spec
-    message = "🌅 Good Morning! Top Overnight Stock Events:\n"
+    # Format message per spec (cleaner style)
+    message = "🌅 *Good Morning! Top Stocks to Watch*\n\n"
     for i, event in enumerate(top_events, 1):
         sentiment_emoji = "🟢" if event.sentiment == "BULLISH" else "🔴"
-        message += f"{i}. {sentiment_emoji} {event.sentiment} ${event.ticker} — {event.headline}\n"
+        message += f"{i}. {sentiment_emoji} *{event.sentiment}* ${event.ticker}\n"
+        message += f"   {event.headline}\n"
         message += f"   Confidence: {event.confidence_score:.0%}\n"
-        message += f"   Reasons: {', '.join(event.importance_reasons)}\n"
-        message += f"   [Source]({event.source_url})\n"
+        message += f"   [Source]({event.source_url})\n\n"
 
     message += f"_Generated at {now.strftime('%H:%M')}_"
 
@@ -841,7 +840,7 @@ def send_wake_up_report():
         logging.error("[WAKE_UP] Failed to send morning report")
 
 def send_trading_report():
-    """[CHANGE] Send top 5 bullish/bearish events by confidence; avoid duplicate headlines"""
+    """[CHANGE] Send a single combined 5-minute report: top 5 bullish/bearish by confidence; avoid duplicate headlines"""
     if not news_events:
         print("[REPORT] No events to report")
         return
@@ -862,13 +861,12 @@ def send_trading_report():
         logging.info("[REPORT] No events selected for report")
         return
 
-    message = f"📈 *Trading Alert - Top {len(top_events)} Events*\n\n"
+    message = f"📈 *Top 5 Stock Events – Next Moves*\n\n"
     for i, event in enumerate(top_events, 1):
         sentiment_emoji = "🟢" if event.sentiment == "BULLISH" else "🔴"
         message += f"{i}. {sentiment_emoji} *{event.sentiment}* ${event.ticker}\n"
         message += f"   {event.headline}\n"
-        message += f"   Confidence: {event.confidence_score:.1%}\n"
-        message += f"   Reasons: {', '.join(event.importance_reasons)}\n"
+        message += f"   Confidence: {event.confidence_score:.0%}\n"
         message += f"   [Source]({event.source_url})\n\n"
 
     message += f"_Report generated at {datetime.now().strftime('%H:%M:%S')}_"
